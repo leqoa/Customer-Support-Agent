@@ -5,6 +5,7 @@ This is intentionally a lightweight implementation with clear TODOs and
 places to harden authentication, paging, rate-limiting, and webhook handling.
 """
 import os
+import random
 import time
 import logging
 from pathlib import Path
@@ -39,19 +40,15 @@ class ZohoSync:
         self,
         api_base: str = ZOHO_API_BASE,
         token: Optional[str] = None,
-        config_path: str = DEFAULT_CONFIG_PATH,
+        max_retry_attempts: int = DEFAULT_MAX_RETRY_ATTEMPTS,
+        retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+        retry_jitter: float = DEFAULT_RETRY_JITTER,
     ):
         self.api_base = api_base
         self.token = token or ZOHO_API_TOKEN
-        self.field_map = _load_field_map(config_path)
-        # Lightweight operational counters. No external metrics dependency;
-        # these are plain instance attributes something like a future
-        # /metrics endpoint could read.
-        self.metrics: Dict[str, int] = {
-            "requests_made": 0,
-            "requests_failed": 0,
-            "tickets_fetched": 0,
-        }
+        self.max_retry_attempts = max_retry_attempts
+        self.retry_base_delay = retry_base_delay
+        self.retry_jitter = retry_jitter
         if not self.token:
             logger.warning("Zoho API token is not configured. ZohoSync will not call external APIs.")
 
@@ -199,7 +196,7 @@ class ZohoSync:
         url = f"{self.api_base}/crm/v2/Tickets/{crm_id}"
         self.metrics["requests_made"] += 1
         try:
-            resp = requests.get(url, headers=self._headers(), timeout=10)
+            resp = self._request_with_retry("GET", url, headers=self._headers(), timeout=10)
             resp.raise_for_status()
             item = resp.json().get("data", [None])[0]
             if not item:
@@ -256,7 +253,7 @@ class ZohoSync:
         }
         self.metrics["requests_made"] += 1
         try:
-            resp = requests.put(url, headers=self._headers(), json=payload, timeout=10)
+            resp = self._request_with_retry("PUT", url, headers=self._headers(), json=payload, timeout=10)
             resp.raise_for_status()
             logger.info(f"Synced ticket {ticket.id} to Zoho (crm_id={ticket.crm_ticket_id})")
             return True
