@@ -20,6 +20,18 @@ from backend.integrations.zoho_sync import (
 from backend.models.ticket import Ticket, CustomerInfo, TicketStatus
 
 
+@pytest.fixture(autouse=True)
+def _no_real_sleeping():
+    """ZohoSync now retries retryable (429/5xx) responses with real backoff
+    delays (see the retry/backoff hardening). None of the failure scenarios
+    in this file are testing retry timing itself (that's covered in
+    test_zoho_sync_retry.py) -- they just want to observe the eventual
+    failure -- so skip the actual sleeping everywhere in this file.
+    """
+    with patch("backend.integrations.zoho_sync.time.sleep"):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Field map config loading
 # ---------------------------------------------------------------------------
@@ -139,7 +151,7 @@ def _mock_failing_response(status_code=500, body="Internal Server Error"):
 def test_fetch_tickets_default_returns_empty_list_on_api_failure(tmp_path):
     client = ZohoSync(token="fake-token", config_path=str(tmp_path / "missing.yaml"))
 
-    with patch("backend.integrations.zoho_sync.requests.get", return_value=_mock_failing_response()):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_failing_response()):
         result = client.fetch_tickets()
 
     assert result == []
@@ -148,7 +160,7 @@ def test_fetch_tickets_default_returns_empty_list_on_api_failure(tmp_path):
 def test_fetch_tickets_raise_on_error_raises_zoho_api_error(tmp_path):
     client = ZohoSync(token="fake-token", config_path=str(tmp_path / "missing.yaml"))
 
-    with patch("backend.integrations.zoho_sync.requests.get", return_value=_mock_failing_response(503, "boom")):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_failing_response(503, "boom")):
         with pytest.raises(ZohoAPIError) as exc_info:
             client.fetch_tickets(raise_on_error=True)
 
@@ -177,7 +189,7 @@ def test_fetch_tickets_no_token_raise_on_error_raises_config_error(tmp_path):
 def test_get_ticket_by_crm_id_default_returns_none_on_failure(tmp_path):
     client = ZohoSync(token="fake-token", config_path=str(tmp_path / "missing.yaml"))
 
-    with patch("backend.integrations.zoho_sync.requests.get", return_value=_mock_failing_response()):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_failing_response()):
         result = client.get_ticket_by_crm_id("123")
 
     assert result is None
@@ -186,7 +198,7 @@ def test_get_ticket_by_crm_id_default_returns_none_on_failure(tmp_path):
 def test_get_ticket_by_crm_id_raise_on_error_raises_api_error(tmp_path):
     client = ZohoSync(token="fake-token", config_path=str(tmp_path / "missing.yaml"))
 
-    with patch("backend.integrations.zoho_sync.requests.get", return_value=_mock_failing_response(404, "not found")):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_failing_response(404, "not found")):
         with pytest.raises(ZohoAPIError):
             client.get_ticket_by_crm_id("123", raise_on_error=True)
 
@@ -202,7 +214,7 @@ def test_sync_ticket_to_zoho_default_returns_false_on_failure(tmp_path):
         crm_ticket_id="zcrm-1",
     )
 
-    with patch("backend.integrations.zoho_sync.requests.put", return_value=_mock_failing_response()):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_failing_response()):
         result = client.sync_ticket_to_zoho(ticket)
 
     assert result is False
@@ -219,7 +231,7 @@ def test_sync_ticket_to_zoho_raise_on_error_raises_api_error(tmp_path):
         crm_ticket_id="zcrm-1",
     )
 
-    with patch("backend.integrations.zoho_sync.requests.put", return_value=_mock_failing_response(500, "err")):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_failing_response(500, "err")):
         with pytest.raises(ZohoAPIError):
             client.sync_ticket_to_zoho(ticket, raise_on_error=True)
 
@@ -265,7 +277,7 @@ def test_metrics_increment_on_successful_fetch(tmp_path):
         ]
     }
 
-    with patch("backend.integrations.zoho_sync.requests.get", return_value=_mock_success_response(payload)):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_success_response(payload)):
         tickets = client.fetch_tickets()
 
     assert len(tickets) == 2
@@ -278,10 +290,10 @@ def test_metrics_increment_across_multiple_calls_including_failures(tmp_path):
     client = ZohoSync(token="fake-token", config_path=str(tmp_path / "missing.yaml"))
     payload = {"data": [{"id": "1", "Subject": "Issue A"}]}
 
-    with patch("backend.integrations.zoho_sync.requests.get", return_value=_mock_success_response(payload)):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_success_response(payload)):
         client.fetch_tickets()
 
-    with patch("backend.integrations.zoho_sync.requests.get", return_value=_mock_failing_response()):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_failing_response()):
         client.fetch_tickets()
 
     assert client.metrics["requests_made"] == 2
@@ -299,7 +311,7 @@ def test_metrics_track_failed_sync_calls(tmp_path):
         crm_ticket_id="zcrm-1",
     )
 
-    with patch("backend.integrations.zoho_sync.requests.put", return_value=_mock_failing_response()):
+    with patch("backend.integrations.zoho_sync.requests.request", return_value=_mock_failing_response()):
         client.sync_ticket_to_zoho(ticket)
 
     assert client.metrics["requests_made"] == 1
