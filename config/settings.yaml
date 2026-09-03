@@ -1,0 +1,59 @@
+# AI-ITSS Configuration
+
+app:
+  name: "AI-ITSS"
+  version: "0.1.0"
+  environment: "development"
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+workflow:
+  # Confidence thresholds for routing decisions
+  confidence_thresholds:
+    escalate: 0.5  # Below this: escalate
+    review: 0.75   # Between escalate and review: human review
+    auto: 0.85     # Above this: ready for agent
+
+integrations:
+  # Zoho CRM configuration
+  zoho:
+    enabled: false
+    api_base_url: "https://www.zohoapis.com"
+    api_version: "v1"
+    # API credentials should be in environment variables
+  
+  # Jira configuration
+  jira:
+    enabled: false
+    api_base_url: "https://your-jira-instance.atlassian.net"
+    api_version: "v3"
+    # API credentials should be in environment variables
+  
+  # MCP/Plugin configuration
+  mcp:
+    enabled: false
+    plugin_directory: "./mcp_plugins"
+
+mcp_plugins:
+  # Example MCP plugins (to be implemented in Phase 2)
+  knowledge_base:
+    enabled: false
+    type: "confluent"
+  
+  diagnostics:
+    enabled: false
+    type: "custom"
+  
+  slack:
+    enabled: false
+    type: "slack"
+  
+  confluence:
+    enabled: false
+    type: "confluence"
+
+database:
+  type: "postgresql"  # or sqlite for local dev
+  # Connection details in environment variables
