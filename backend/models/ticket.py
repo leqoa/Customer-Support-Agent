@@ -145,6 +145,7 @@ class Ticket:
             "crm_system": self.crm_system,
             "ai_workflow_state": self.ai_workflow_state.value,
             "ai_context": self.ai_context.__dict__,
+            "ai_draft": self.ai_draft.__dict__ if self.ai_draft else None,
             "escalation_info": self.escalation_info.__dict__ if self.escalation_info else None,
             "conversation_history": self.conversation_history
         }
