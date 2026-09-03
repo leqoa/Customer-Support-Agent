@@ -29,8 +29,10 @@ compatibility with older deployments. It is never refreshed and logs a
 deprecation warning; new deployments should use the OAuth2 flow instead.
 """
 import os
+import random
 import time
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import requests
 from backend.models.ticket import Ticket, CustomerInfo, TicketPriority, TicketStatus
@@ -66,122 +68,21 @@ class ZohoSync:
     - Verify response schemas and map custom fields
     """
 
-    # Refresh this many seconds before the token's reported expiry to
-    # avoid using a token that expires mid-request.
-    TOKEN_SAFETY_MARGIN_SECONDS = 60
-
     def __init__(
         self,
         api_base: str = ZOHO_API_BASE,
         token: Optional[str] = None,
-        client_id: Optional[str] = None,
-        client_secret: Optional[str] = None,
-        refresh_token: Optional[str] = None,
-        accounts_base: Optional[str] = None,
+        max_retry_attempts: int = DEFAULT_MAX_RETRY_ATTEMPTS,
+        retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+        retry_jitter: float = DEFAULT_RETRY_JITTER,
     ):
         self.api_base = api_base
-        self.accounts_base = accounts_base or ZOHO_ACCOUNTS_BASE
-
-        self.client_id = client_id or ZOHO_OAUTH_CLIENT_ID
-        self.client_secret = client_secret or ZOHO_OAUTH_CLIENT_SECRET
-        self.refresh_token = refresh_token or ZOHO_REFRESH_TOKEN
-        self._oauth_configured = bool(self.client_id and self.client_secret and self.refresh_token)
-
-        # Deprecated static-token fallback (never logged, never refreshed).
-        self._static_token = token or ZOHO_API_TOKEN
-
-        self._access_token: Optional[str] = None
-        self._token_expiry: float = 0.0
-
-        if self._oauth_configured:
-            logger.debug("ZohoSync configured with OAuth2 refresh-token authentication.")
-        elif self._static_token:
-            logger.warning(
-                "ZohoSync is using the deprecated static ZOHO_API_TOKEN for authentication. "
-                "This token is never refreshed and will eventually expire or be revoked. "
-                "Configure ZOHO_OAUTH_CLIENT_ID, ZOHO_OAUTH_CLIENT_SECRET, and "
-                "ZOHO_REFRESH_TOKEN to use the supported OAuth2 refresh-token flow."
-            )
-        else:
-            logger.warning(
-                "Zoho credentials are not configured (missing OAuth2 env vars and "
-                "ZOHO_API_TOKEN). ZohoSync will not call external APIs."
-            )
-
-    def _has_credentials(self) -> bool:
-        """Whether any usable form of Zoho credentials has been configured."""
-        return bool(self._oauth_configured or self._static_token)
-
-    def _refresh_access_token(self) -> str:
-        """Exchange the refresh token for a new access token and cache it.
-
-        Raises:
-            ZohoAuthError: if OAuth2 is not configured, the request fails,
-                or the response does not contain a usable access token.
-        """
-        if not self._oauth_configured:
-            raise ZohoAuthError(
-                "Cannot refresh Zoho access token: OAuth2 credentials "
-                "(ZOHO_OAUTH_CLIENT_ID, ZOHO_OAUTH_CLIENT_SECRET, ZOHO_REFRESH_TOKEN) "
-                "are not configured."
-            )
-
-        url = f"{self.accounts_base}/oauth/v2/token"
-        data = {
-            "grant_type": "refresh_token",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "refresh_token": self.refresh_token,
-        }
-
-        try:
-            resp = requests.post(url, data=data, timeout=10)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            logger.error("Failed to refresh Zoho access token: %s", e)
-            raise ZohoAuthError(f"Failed to refresh Zoho access token: {e}") from e
-
-        try:
-            payload = resp.json()
-        except ValueError as e:
-            raise ZohoAuthError("Zoho token endpoint returned a non-JSON response") from e
-
-        access_token = payload.get("access_token")
-        expires_in = payload.get("expires_in")
-
-        if not access_token:
-            error_desc = payload.get("error") or "no access_token in response"
-            logger.error("Zoho token refresh failed: %s", error_desc)
-            raise ZohoAuthError(f"Zoho token refresh failed: {error_desc}")
-
-        if not isinstance(expires_in, (int, float)):
-            # Zoho's documented default access token lifetime is 1 hour.
-            expires_in = 3600
-
-        self._access_token = access_token
-        self._token_expiry = time.time() + expires_in - self.TOKEN_SAFETY_MARGIN_SECONDS
-        logger.info("Refreshed Zoho OAuth2 access token (expires_in=%ss)", expires_in)
-        return self._access_token
-
-    def _get_valid_token(self) -> str:
-        """Return a currently-valid access token, refreshing it if needed.
-
-        Raises:
-            ZohoAuthError: if no credentials are configured or refreshing fails.
-        """
-        if self._oauth_configured:
-            if self._access_token and time.time() < self._token_expiry:
-                return self._access_token
-            return self._refresh_access_token()
-
-        if self._static_token:
-            return self._static_token
-
-        raise ZohoAuthError(
-            "Zoho credentials are not configured. Set ZOHO_OAUTH_CLIENT_ID, "
-            "ZOHO_OAUTH_CLIENT_SECRET, and ZOHO_REFRESH_TOKEN (or the deprecated "
-            "ZOHO_API_TOKEN)."
-        )
+        self.token = token or ZOHO_API_TOKEN
+        self.max_retry_attempts = max_retry_attempts
+        self.retry_base_delay = retry_base_delay
+        self.retry_jitter = retry_jitter
+        if not self.token:
+            logger.warning("Zoho API token is not configured. ZohoSync will not call external APIs.")
 
     def _headers(self) -> Dict[str, str]:
         token = self._get_valid_token()
@@ -260,8 +161,10 @@ class ZohoSync:
             max_records: optional cap on the total number of records
                 returned; None means unlimited (subject to MAX_PAGES).
         """
-        if not self._has_credentials():
-            logger.debug("Zoho credentials missing; returning empty ticket list (mock mode)")
+        if not self.token:
+            logger.debug("Zoho token missing; returning empty ticket list (mock mode)")
+            if raise_on_error:
+                raise ZohoConfigError("Zoho API token is not configured")
             return []
 
         base_params = dict(filter_dict or {})
@@ -301,6 +204,9 @@ class ZohoSync:
 
                 page += 1
 
+            elapsed = time.perf_counter() - start
+            self.metrics["tickets_fetched"] += len(tickets)
+            logger.info(f"Fetched {len(tickets)} ticket(s) from Zoho in {elapsed:.3f}s")
             return tickets
 
         except ZohoAuthError as e:
@@ -310,44 +216,68 @@ class ZohoSync:
             logger.error(f"Error fetching tickets from Zoho: {e}")
             return tickets
 
-    def get_ticket_by_crm_id(self, crm_id: str) -> Optional[Ticket]:
+    def get_ticket_by_crm_id(self, crm_id: str, raise_on_error: bool = False) -> Optional[Ticket]:
         """Fetch a single ticket by its Zoho CRM id and convert to Ticket.
 
-        This is a thin wrapper and will return None on errors.
+        By default (raise_on_error=False) this returns None on any failure,
+        preserving prior behavior. Pass raise_on_error=True to raise
+        ZohoConfigError (missing token) or ZohoAPIError (failed API call)
+        instead.
         """
-        if not self._has_credentials():
+        fm = self.field_map
+        if not self.token:
+            if raise_on_error:
+                raise ZohoConfigError("Zoho API token is not configured")
             return None
         url = f"{self.api_base}/crm/v2/Tickets/{crm_id}"
+        self.metrics["requests_made"] += 1
         try:
-            resp = requests.get(url, headers=self._headers(), timeout=10)
+            resp = self._request_with_retry("GET", url, headers=self._headers(), timeout=10)
             resp.raise_for_status()
             item = resp.json().get("data", [None])[0]
             if not item:
                 return None
             # reuse logic from fetch_tickets - minimal mapping
             crm_id = str(item.get("id"))
-            subject = item.get("Subject") or "No subject"
-            desc = item.get("Description") or ""
-            customer = CustomerInfo(id=str(item.get("Contact_Name", {}).get("id") if isinstance(item.get("Contact_Name"), dict) else "unknown"),
-                                    name=item.get("Contact_Name", {}).get("name") if isinstance(item.get("Contact_Name"), dict) else item.get("Contact_Name"),
-                                    email=item.get("Email") or "")
+            subject = item.get(fm["subject"]) or "No subject"
+            desc = item.get(fm["description"]) or ""
+            contact_field = item.get(fm["contact_name"])
+            customer = CustomerInfo(
+                id=str(contact_field.get("id") if isinstance(contact_field, dict) else "unknown"),
+                name=contact_field.get("name") if isinstance(contact_field, dict) else contact_field,
+                email=item.get(fm["email"]) or ""
+            )
             ticket = Ticket(id=f"zoho-{crm_id}", subject=subject, description=desc, customer=customer, crm_ticket_id=crm_id, crm_system="zoho")
             return ticket
         except ZohoAuthError as e:
             logger.error(f"Zoho authentication error while fetching ticket {crm_id}: {e}")
             return None
         except requests.RequestException as e:
+            self.metrics["requests_failed"] += 1
             logger.error(f"Error fetching Zoho ticket {crm_id}: {e}")
+            if raise_on_error:
+                status_code, body = self._error_details(e)
+                raise ZohoAPIError(
+                    f"Error fetching Zoho ticket {crm_id}: {e}", status_code=status_code, response_body=body
+                ) from e
             return None
 
-    def sync_ticket_to_zoho(self, ticket: Ticket) -> bool:
+    def sync_ticket_to_zoho(self, ticket: Ticket, raise_on_error: bool = False) -> bool:
         """Sync local ticket updates to Zoho.
 
         For Phase 2 we implement a minimal update of status and comments.
         Returns True on success.
+
+        By default (raise_on_error=False) this returns False on any failure,
+        preserving prior behavior. Pass raise_on_error=True to raise
+        ZohoConfigError (missing token/crm_ticket_id) or ZohoAPIError (failed
+        API call) instead.
         """
-        if not self._has_credentials() or not ticket.crm_ticket_id:
-            logger.warning("Cannot sync to Zoho: missing credentials or crm_ticket_id")
+        fm = self.field_map
+        if not self.token or not ticket.crm_ticket_id:
+            logger.warning("Cannot sync to Zoho: missing token or crm_ticket_id")
+            if raise_on_error:
+                raise ZohoConfigError("Cannot sync to Zoho: missing token or crm_ticket_id")
             return False
 
         url = f"{self.api_base}/crm/v2/Tickets/{ticket.crm_ticket_id}"
@@ -355,13 +285,14 @@ class ZohoSync:
             "data": [
                 {
                     # Map fields; Zoho field names may vary per setup
-                    "Status": ticket.status.value,
-                    "Description": ticket.description
+                    fm["status"]: ticket.status.value,
+                    fm["description"]: ticket.description
                 }
             ]
         }
+        self.metrics["requests_made"] += 1
         try:
-            resp = requests.put(url, headers=self._headers(), json=payload, timeout=10)
+            resp = self._request_with_retry("PUT", url, headers=self._headers(), json=payload, timeout=10)
             resp.raise_for_status()
             logger.info(f"Synced ticket {ticket.id} to Zoho (crm_id={ticket.crm_ticket_id})")
             return True
@@ -369,5 +300,11 @@ class ZohoSync:
             logger.error(f"Zoho authentication error while syncing ticket: {e}")
             return False
         except requests.RequestException as e:
+            self.metrics["requests_failed"] += 1
             logger.error(f"Failed to sync ticket to Zoho: {e}")
+            if raise_on_error:
+                status_code, body = self._error_details(e)
+                raise ZohoAPIError(
+                    f"Failed to sync ticket to Zoho: {e}", status_code=status_code, response_body=body
+                ) from e
             return False

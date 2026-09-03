@@ -1,4 +1,10 @@
 # AI-ITSS Configuration
+#
+# This file intentionally holds no secrets or environment-specific values —
+# only non-sensitive application configuration and feature toggles.
+# For API tokens, base URLs that vary per environment, and other secrets
+# (e.g. Zoho credentials), see `.env.example` at the repo root, copy it to
+# `.env`, and fill in real values there.
 
 app:
   name: "AI-ITSS"
@@ -23,6 +29,19 @@ integrations:
     api_base_url: "https://www.zohoapis.com"
     api_version: "v1"
     # API credentials should be in environment variables
+    # Maps internal field names to Zoho field names. Override any of these
+    # if your Zoho org uses custom field names. Any keys omitted here fall
+    # back to the built-in defaults.
+    field_map:
+      subject: "Subject"
+      description: "Description"
+      priority: "Priority"
+      status: "Status"
+      contact_name: "Contact_Name"
+      email: "Email"
+      phone: "Phone"
+      account_name: "Account_Name"
+      ticket_url: "ticket_url"
   
   # Jira configuration
   jira:
