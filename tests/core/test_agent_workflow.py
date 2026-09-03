@@ -4,10 +4,11 @@ These cover two things:
   1. That the workflow runs correctly end-to-end using real services when
      they're available (mocked here, since we have no real LLM/Jira
      credentials).
-  2. That it degrades gracefully -- and, in this repo checkout, genuinely
-     does, since backend.core.llm_service and backend.integrations.jira_sync
-     don't exist here yet -- when those optional integrations aren't
-     available or fail.
+  2. That it degrades gracefully when LLMService/JiraSync are unavailable
+     (module missing) or, as is actually exercised below with no mocking
+     at all, available but unconfigured (no API keys / Jira credentials
+     in this environment) -- both cases must produce the same safe
+     placeholder/local-only behavior.
 """
 from unittest.mock import Mock
 
@@ -28,31 +29,34 @@ def make_ticket(ticket_id="t-1", subject="App crashes on login", description="Th
 
 
 class TestRealDependencyAvailability:
-    def test_llm_service_and_jira_sync_are_not_yet_merged_in_this_checkout(self):
+    def test_llm_service_and_jira_sync_are_available(self):
         """
-        Sanity check documenting the current state of this repo: these two
-        Phase 2 modules are separate, still-open PRs as of this change, so
-        the optional imports in agent_workflow.py resolve to None here --
-        which is exactly the condition the rest of this test file (and the
-        real, unmocked constructor below) exercises.
+        LLMService (#9) and JiraSync (#7) have both merged, so
+        agent_workflow.py's optional imports now resolve to the real
+        classes. The rest of this file (below) still exercises the
+        fallback behavior -- not because these modules are missing, but
+        because neither has real credentials configured in this test
+        environment, which is the more common real-world case anyway.
         """
-        assert LLMService is None
-        assert JiraSync is None
+        assert LLMService is not None
+        assert JiraSync is not None
 
 
-class TestWorkflowWithoutOptionalIntegrations:
+class TestWorkflowWithUnconfiguredIntegrations:
     """
     These tests use a real, unmodified AgentWorkflow() as constructed in
-    *this* checkout -- llm_service and jira_sync end up None because their
-    modules aren't merged yet, so this is a genuine (not mocked) exercise
-    of the fallback path end-to-end, including the real (merged)
-    KnowledgeRetriever with no MCP registry configured.
+    *this* checkout. LLMService and JiraSync are real (not None) here, but
+    neither has credentials configured in this environment (no
+    OPENAI_API_KEY/ANTHROPIC_API_KEY, no JIRA_BASE_URL/EMAIL/API_TOKEN) --
+    so this exercises each service's own real, unmocked graceful-fallback
+    behavior end-to-end, together with the real (merged) KnowledgeRetriever
+    with no MCP registry configured.
     """
 
     def test_full_workflow_completes_with_no_errors(self):
         workflow = AgentWorkflow()
-        assert workflow.llm_service is None
-        assert workflow.jira_sync is None
+        assert workflow.llm_service is not None
+        assert workflow.jira_sync is not None
 
         ticket = make_ticket()
         result = workflow.execute_workflow(ticket)
@@ -62,7 +66,9 @@ class TestWorkflowWithoutOptionalIntegrations:
             "classify", "retrieve_knowledge", "generate_draft", "evaluate_confidence", "route_for_review"
         ]
         assert ticket.ai_draft is not None
-        assert ticket.ai_draft.model_used == "gpt-4"  # placeholder draft's tag
+        # No OPENAI_API_KEY/ANTHROPIC_API_KEY configured -> LLMService's own
+        # mock-fallback response, per its documented model_used tag.
+        assert ticket.ai_draft.model_used == "mock-fallback"
 
     def test_knowledge_retrieval_returns_real_shape_via_local_fallback(self):
         workflow = AgentWorkflow()

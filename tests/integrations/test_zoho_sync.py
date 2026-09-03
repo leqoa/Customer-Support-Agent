@@ -92,14 +92,14 @@ def sync():
 
 class TestNoToken:
     def test_fetch_tickets_returns_empty_list_without_http_call(self, no_token_sync):
-        with patch("backend.integrations.zoho_sync.requests.get") as mock_get:
+        with patch("backend.integrations.zoho_sync.requests.request") as mock_get:
             result = no_token_sync.fetch_tickets()
 
         assert result == []
         mock_get.assert_not_called()
 
     def test_get_ticket_by_crm_id_returns_none_without_http_call(self, no_token_sync):
-        with patch("backend.integrations.zoho_sync.requests.get") as mock_get:
+        with patch("backend.integrations.zoho_sync.requests.request") as mock_get:
             result = no_token_sync.get_ticket_by_crm_id("112233")
 
         assert result is None
@@ -142,7 +142,7 @@ class TestFetchTicketsMapping:
         ]
         response = make_response({"data": records})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response) as mock_get:
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response) as mock_get:
             tickets = sync.fetch_tickets()
 
         assert mock_get.called
@@ -180,12 +180,15 @@ class TestFetchTicketsMapping:
         response = make_response({"data": []})
         filter_dict = {"status": "open"}
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response) as mock_get:
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response) as mock_get:
             result = sync.fetch_tickets(filter_dict=filter_dict)
 
         assert result == []
         _, kwargs = mock_get.call_args
-        assert kwargs["params"] == filter_dict
+        # Pagination params (page/per_page) are layered on top of filter_dict,
+        # not a replacement for it -- see test_zoho_sync_pagination.py for
+        # dedicated coverage of that behavior.
+        assert kwargs["params"]["status"] == filter_dict["status"]
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +211,7 @@ class TestPriorityMapping:
         record = zoho_ticket(Priority=raw_priority)
         response = make_response({"data": [record]})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             tickets = sync.fetch_tickets()
 
         assert tickets[0].priority == expected
@@ -218,7 +221,7 @@ class TestPriorityMapping:
         del record["Priority"]
         response = make_response({"data": [record]})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             tickets = sync.fetch_tickets()
 
         assert tickets[0].priority == TicketPriority.MEDIUM
@@ -246,7 +249,7 @@ class TestStatusMapping:
         record = zoho_ticket(Status=raw_status)
         response = make_response({"data": [record]})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             tickets = sync.fetch_tickets()
 
         assert tickets[0].status == expected
@@ -256,7 +259,7 @@ class TestStatusMapping:
         del record["Status"]
         response = make_response({"data": [record]})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             tickets = sync.fetch_tickets()
 
         assert tickets[0].status == TicketStatus.NEW
@@ -273,7 +276,7 @@ class TestDefensiveParsing:
         record = {"id": "999999"}
         response = make_response({"data": [record]})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             tickets = sync.fetch_tickets()
 
         assert len(tickets) == 1
@@ -295,7 +298,7 @@ class TestDefensiveParsing:
         record = {"Subject": "Orphan ticket with no id"}
         response = make_response({"data": [record]})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             tickets = sync.fetch_tickets()
 
         assert len(tickets) == 1
@@ -310,7 +313,7 @@ class TestDefensiveParsing:
 class TestFetchTicketsErrors:
     def test_request_exception_returns_empty_list(self, sync):
         with patch(
-            "backend.integrations.zoho_sync.requests.get",
+            "backend.integrations.zoho_sync.requests.request",
             side_effect=requests.RequestException("connection failed"),
         ):
             result = sync.fetch_tickets()
@@ -321,7 +324,7 @@ class TestFetchTicketsErrors:
         response = make_response(
             {}, status_code=500, raise_exc=requests.HTTPError("500 Server Error")
         )
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             result = sync.fetch_tickets()
 
         assert result == []
@@ -342,7 +345,7 @@ class TestGetTicketByCrmId:
         )
         response = make_response({"data": [record]})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response) as mock_get:
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response) as mock_get:
             ticket = sync.get_ticket_by_crm_id("778899")
 
         assert mock_get.called
@@ -363,7 +366,7 @@ class TestGetTicketByCrmId:
     def test_missing_data_key_returns_none(self, sync):
         response = make_response({})  # no "data" key at all
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             result = sync.get_ticket_by_crm_id("778899")
 
         assert result is None
@@ -377,13 +380,13 @@ class TestGetTicketByCrmId:
         # propagates out of get_ticket_by_crm_id rather than returning None.
         response = make_response({"data": []})
 
-        with patch("backend.integrations.zoho_sync.requests.get", return_value=response):
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response):
             with pytest.raises(IndexError):
                 sync.get_ticket_by_crm_id("778899")
 
     def test_request_exception_returns_none(self, sync):
         with patch(
-            "backend.integrations.zoho_sync.requests.get",
+            "backend.integrations.zoho_sync.requests.request",
             side_effect=requests.RequestException("timeout"),
         ):
             result = sync.get_ticket_by_crm_id("778899")
@@ -414,13 +417,13 @@ class TestSyncTicketToZoho:
         ticket = self._make_ticket(crm_ticket_id="112233")
         response = make_response({"data": [{"code": "SUCCESS"}]}, status_code=200)
 
-        with patch("backend.integrations.zoho_sync.requests.put", return_value=response) as mock_put:
+        with patch("backend.integrations.zoho_sync.requests.request", return_value=response) as mock_put:
             result = sync.sync_ticket_to_zoho(ticket)
 
         assert result is True
         assert mock_put.called
         args, kwargs = mock_put.call_args
-        url = args[0] if args else kwargs.get("url")
+        url = args[1] if len(args) > 1 else (args[0] if args else kwargs.get("url"))
         assert "112233" in url
         payload = kwargs["json"]
         item = payload["data"][0]
@@ -430,7 +433,7 @@ class TestSyncTicketToZoho:
     def test_missing_crm_ticket_id_returns_false_without_http_call(self, sync):
         ticket = self._make_ticket(crm_ticket_id=None)
 
-        with patch("backend.integrations.zoho_sync.requests.put") as mock_put:
+        with patch("backend.integrations.zoho_sync.requests.request") as mock_put:
             result = sync.sync_ticket_to_zoho(ticket)
 
         assert result is False
@@ -439,7 +442,7 @@ class TestSyncTicketToZoho:
     def test_no_token_returns_false_without_http_call(self, no_token_sync):
         ticket = self._make_ticket(crm_ticket_id="112233")
 
-        with patch("backend.integrations.zoho_sync.requests.put") as mock_put:
+        with patch("backend.integrations.zoho_sync.requests.request") as mock_put:
             result = no_token_sync.sync_ticket_to_zoho(ticket)
 
         assert result is False
@@ -449,7 +452,7 @@ class TestSyncTicketToZoho:
         ticket = self._make_ticket(crm_ticket_id="112233")
 
         with patch(
-            "backend.integrations.zoho_sync.requests.put",
+            "backend.integrations.zoho_sync.requests.request",
             side_effect=requests.RequestException("connection reset"),
         ):
             result = sync.sync_ticket_to_zoho(ticket)

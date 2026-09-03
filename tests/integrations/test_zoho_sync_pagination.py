@@ -11,6 +11,7 @@ from backend.integrations.zoho_sync import ZohoSync, MAX_PAGES
 def _make_response(items, more_records):
     """Build a fake requests.Response-like object for a single Zoho page."""
     resp = MagicMock()
+    resp.status_code = 200
     resp.raise_for_status = MagicMock()
     resp.json.return_value = {
         "data": items,
@@ -36,7 +37,7 @@ class TestFetchTicketsPagination:
     def _client(self):
         return ZohoSync(api_base="https://fake.zohoapis.com", token="fake-token")
 
-    @patch("backend.integrations.zoho_sync.requests.get")
+    @patch("backend.integrations.zoho_sync.requests.request")
     def test_paginates_across_multiple_pages_and_concatenates_results(self, mock_get):
         page1 = _make_response([_zoho_item(1), _zoho_item(2)], more_records=True)
         page2 = _make_response([_zoho_item(3), _zoho_item(4)], more_records=True)
@@ -58,7 +59,7 @@ class TestFetchTicketsPagination:
         # Exactly 3 requests were made (one per page).
         assert mock_get.call_count == 3
 
-    @patch("backend.integrations.zoho_sync.requests.get")
+    @patch("backend.integrations.zoho_sync.requests.request")
     def test_stops_calling_api_once_more_records_is_false(self, mock_get):
         page1 = _make_response([_zoho_item(1)], more_records=False)
         mock_get.side_effect = [page1]
@@ -71,9 +72,10 @@ class TestFetchTicketsPagination:
         # since more_records was false on the first (and only) response.
         mock_get.assert_called_once()
 
-    @patch("backend.integrations.zoho_sync.requests.get")
+    @patch("backend.integrations.zoho_sync.requests.request")
     def test_missing_info_object_is_treated_as_no_more_records(self, mock_get):
         resp = MagicMock()
+        resp.status_code = 200
         resp.raise_for_status = MagicMock()
         resp.json.return_value = {"data": [_zoho_item(1)]}  # no "info" key at all
         mock_get.side_effect = [resp]
@@ -84,7 +86,7 @@ class TestFetchTicketsPagination:
         assert len(tickets) == 1
         mock_get.assert_called_once()
 
-    @patch("backend.integrations.zoho_sync.requests.get")
+    @patch("backend.integrations.zoho_sync.requests.request")
     def test_pagination_params_layered_on_top_of_filter_dict(self, mock_get):
         page1 = _make_response([_zoho_item(1)], more_records=False)
         mock_get.side_effect = [page1]
@@ -100,7 +102,7 @@ class TestFetchTicketsPagination:
         assert params["page"] == 1
         assert params["per_page"] == 50
 
-    @patch("backend.integrations.zoho_sync.requests.get")
+    @patch("backend.integrations.zoho_sync.requests.request")
     def test_max_records_caps_results_and_stops_early(self, mock_get):
         page1 = _make_response([_zoho_item(1), _zoho_item(2)], more_records=True)
         page2 = _make_response([_zoho_item(3), _zoho_item(4)], more_records=True)
@@ -114,7 +116,7 @@ class TestFetchTicketsPagination:
         # Stopped mid-second-page; no third page request was ever made.
         assert mock_get.call_count == 2
 
-    @patch("backend.integrations.zoho_sync.requests.get")
+    @patch("backend.integrations.zoho_sync.requests.request")
     def test_max_pages_safety_cap_prevents_infinite_loop(self, mock_get):
         # Every page claims there are more records -- without a hard cap
         # this would loop forever.
@@ -129,7 +131,7 @@ class TestFetchTicketsPagination:
         assert mock_get.call_count == MAX_PAGES
         assert len(tickets) == MAX_PAGES
 
-    @patch("backend.integrations.zoho_sync.requests.get")
+    @patch("backend.integrations.zoho_sync.requests.request")
     def test_no_token_returns_empty_list_without_calling_api(self, mock_get):
         client = ZohoSync(api_base="https://fake.zohoapis.com", token=None)
         tickets = client.fetch_tickets()
