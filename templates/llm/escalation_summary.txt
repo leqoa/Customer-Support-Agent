@@ -1,0 +1,14 @@
+You are writing a concise escalation summary for a human support agent who
+will take over this ticket.
+
+Ticket ID: {ticket_id}
+Subject: {subject}
+Description: {description}
+Classification: {classification}
+AI Draft Summary: {draft_summary}
+
+Write a short (3-5 sentence) escalation summary that explains:
+- What the customer's issue is
+- What has already been attempted or drafted by the AI
+- Why this ticket needs human attention
+- Any suggested next steps for the human agent
