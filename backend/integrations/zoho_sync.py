@@ -5,6 +5,8 @@ This is intentionally a lightweight implementation with clear TODOs and
 places to harden authentication, paging, rate-limiting, and webhook handling.
 """
 import os
+import random
+import time
 import logging
 from typing import List, Dict, Any, Optional
 import requests
@@ -14,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 ZOHO_API_BASE = os.getenv("ZOHO_API_BASE", "https://www.zohoapis.com")
 ZOHO_API_TOKEN = os.getenv("ZOHO_API_TOKEN")  # Bearer token
+
+# Retry/backoff defaults for transient Zoho API failures (rate limits, 5xx,
+# connection hiccups). Kept as module-level constants so they're easy to
+# tune without hunting through the retry logic itself.
+DEFAULT_MAX_RETRY_ATTEMPTS = 4
+DEFAULT_RETRY_BASE_DELAY = 0.5  # seconds
+DEFAULT_RETRY_JITTER = 0.25  # seconds, max additional random delay
+RETRYABLE_STATUS_CODES = {429}
+RETRYABLE_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
 
 
 class ZohoSync:
@@ -25,14 +36,91 @@ class ZohoSync:
     - Verify response schemas and map custom fields
     """
 
-    def __init__(self, api_base: str = ZOHO_API_BASE, token: Optional[str] = None):
+    def __init__(
+        self,
+        api_base: str = ZOHO_API_BASE,
+        token: Optional[str] = None,
+        max_retry_attempts: int = DEFAULT_MAX_RETRY_ATTEMPTS,
+        retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+        retry_jitter: float = DEFAULT_RETRY_JITTER,
+    ):
         self.api_base = api_base
         self.token = token or ZOHO_API_TOKEN
+        self.max_retry_attempts = max_retry_attempts
+        self.retry_base_delay = retry_base_delay
+        self.retry_jitter = retry_jitter
         if not self.token:
             logger.warning("Zoho API token is not configured. ZohoSync will not call external APIs.")
 
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Zoho-oauthtoken {self.token}", "Content-Type": "application/json"}
+
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Perform an HTTP request with retry/backoff for transient failures.
+
+        Retries on HTTP 429, any 5xx status code, and connection/timeout
+        errors. Uses exponential backoff with jitter between attempts, and
+        honors a `Retry-After` header on 429 responses when present.
+
+        Raises the last encountered exception (requests.RequestException) or
+        returns the final (non-retryable, or exhausted) requests.Response.
+        """
+        last_exception: Optional[Exception] = None
+        last_response: Optional[requests.Response] = None
+
+        for attempt in range(1, self.max_retry_attempts + 1):
+            try:
+                response = requests.request(method, url, **kwargs)
+            except RETRYABLE_EXCEPTIONS as exc:
+                last_exception = exc
+                if attempt >= self.max_retry_attempts:
+                    logger.error(
+                        f"Zoho request {method} {url} failed after {attempt} attempt(s): {exc}"
+                    )
+                    raise
+                delay = self._compute_backoff_delay(attempt)
+                logger.warning(
+                    f"Zoho request {method} {url} attempt {attempt}/{self.max_retry_attempts} "
+                    f"raised {exc!r}; retrying in {delay:.2f}s"
+                )
+                time.sleep(delay)
+                continue
+
+            is_retryable_status = response.status_code == 429 or response.status_code >= 500
+            if not is_retryable_status:
+                return response
+
+            last_response = response
+            if attempt >= self.max_retry_attempts:
+                logger.error(
+                    f"Zoho request {method} {url} failed after {attempt} attempt(s); "
+                    f"final status {response.status_code}"
+                )
+                return response
+
+            delay = self._compute_backoff_delay(attempt)
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        delay = float(retry_after)
+                    except ValueError:
+                        pass
+
+            logger.warning(
+                f"Zoho request {method} {url} attempt {attempt}/{self.max_retry_attempts} "
+                f"got status {response.status_code}; retrying in {delay:.2f}s"
+            )
+            time.sleep(delay)
+
+        # Should be unreachable, but keep a defensive fallback.
+        if last_exception is not None:
+            raise last_exception
+        return last_response
+
+    def _compute_backoff_delay(self, attempt: int) -> float:
+        """Exponential backoff with jitter for the given attempt number (1-indexed)."""
+        return self.retry_base_delay * (2 ** (attempt - 1)) + random.uniform(0, self.retry_jitter)
 
     def fetch_tickets(self, filter_dict: Optional[Dict[str, Any]] = None) -> List[Ticket]:
         """Fetch tickets from Zoho and convert into internal Ticket objects.
@@ -46,7 +134,7 @@ class ZohoSync:
         params = filter_dict or {}
         url = f"{self.api_base}/crm/v2/Tickets"
         try:
-            resp = requests.get(url, headers=self._headers(), params=params, timeout=10)
+            resp = self._request_with_retry("GET", url, headers=self._headers(), params=params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
             tickets = []
@@ -99,7 +187,9 @@ class ZohoSync:
             return tickets
 
         except requests.RequestException as e:
-            logger.error(f"Error fetching tickets from Zoho: {e}")
+            logger.error(
+                f"Error fetching tickets from Zoho after up to {self.max_retry_attempts} attempt(s): {e}"
+            )
             return []
 
     def get_ticket_by_crm_id(self, crm_id: str) -> Optional[Ticket]:
@@ -111,7 +201,7 @@ class ZohoSync:
             return None
         url = f"{self.api_base}/crm/v2/Tickets/{crm_id}"
         try:
-            resp = requests.get(url, headers=self._headers(), timeout=10)
+            resp = self._request_with_retry("GET", url, headers=self._headers(), timeout=10)
             resp.raise_for_status()
             item = resp.json().get("data", [None])[0]
             if not item:
@@ -150,7 +240,7 @@ class ZohoSync:
             ]
         }
         try:
-            resp = requests.put(url, headers=self._headers(), json=payload, timeout=10)
+            resp = self._request_with_retry("PUT", url, headers=self._headers(), json=payload, timeout=10)
             resp.raise_for_status()
             logger.info(f"Synced ticket {ticket.id} to Zoho (crm_id={ticket.crm_ticket_id})")
             return True
