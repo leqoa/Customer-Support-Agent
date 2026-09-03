@@ -1,4 +1,10 @@
 # AI-ITSS Configuration
+#
+# This file intentionally holds no secrets or environment-specific values —
+# only non-sensitive application configuration and feature toggles.
+# For API tokens, base URLs that vary per environment, and other secrets
+# (e.g. Zoho credentials), see `.env.example` at the repo root, copy it to
+# `.env`, and fill in real values there.
 
 app:
   name: "AI-ITSS"
