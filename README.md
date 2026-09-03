@@ -1,11 +1,11 @@
-# AI-ITSS: Intelligent Ticket Support System
+# AI-ITSS: Intelligent Autonomous Ticket Support System
 
 An AI-powered customer support platform featuring structured agentic workflows, CRM/ITSM integration, and MCP-based plugin extensibility.
 
 ## Features
 
 - 🤖 **Agentic Ticket Workflow**: Ticket classification, knowledge retrieval, draft generation, confidence evaluation, and escalation handling
-- 🔗 **Zoho & Jira Integration**: Two-way sync with CRM and project management systems
+- 🔗 **Zoho & Jira Integration**: Two-way sync with CRM and project management systems for customer support
 - 📊 **Escalation Management**: Structured summaries and automated issue creation in Jira
 - 🏷️ **Non-destructive CRM Tagging**: AI-state reflection without conflicts
 - 🔌 **MCP/Plugin Layer**: Extensible integration with external tools and knowledge bases
