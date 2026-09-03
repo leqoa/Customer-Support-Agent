@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 
 from backend.models.ticket import (
-    Ticket, AiWorkflowState, AiDraft, EscalationInfo, AiWorkflowState
+    Ticket, AiWorkflowState, AiDraft, EscalationInfo
 )
 from backend.core.ticket_processor import TicketProcessor
 from backend.core.confidence_evaluator import ConfidenceEvaluator

@@ -1,0 +1,20 @@
+[tool.ruff]
+# Kept intentionally permissive for this early-stage project: the goal is to
+# catch real errors (unused imports, undefined names, etc.) and keep imports
+# sorted, without forcing a repo-wide reformat of existing code as a side
+# effect of turning on CI. Tighten these over time as the codebase matures.
+line-length = 160
+target-version = "py310"
+
+[tool.ruff.lint]
+# E/F: pyflakes + pycodestyle errors, I: isort (import sorting).
+# Style nitpicks (E501 line-too-long etc. beyond line-length, complexity, etc.)
+# are left off for now to avoid noisy failures on existing code.
+select = ["E", "F", "I"]
+ignore = [
+    "E501",  # line too long — existing code has some long lines; not worth
+             # a repo-wide reformat right now (line-length above still caps it)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports are common/intentional in __init__ re-exports
