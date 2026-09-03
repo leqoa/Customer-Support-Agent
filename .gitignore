@@ -3,7 +3,5 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
-
-# Local SQLite dev database (default DATABASE_URL target for backend/models/db/)
-*.db
-*.db-journal
+*.egg-info/
+.env
