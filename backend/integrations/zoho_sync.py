@@ -8,6 +8,7 @@ import os
 import random
 import time
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import requests
 from backend.models.ticket import Ticket, CustomerInfo, TicketPriority, TicketStatus
@@ -129,6 +130,8 @@ class ZohoSync:
         """
         if not self.token:
             logger.debug("Zoho token missing; returning empty ticket list (mock mode)")
+            if raise_on_error:
+                raise ZohoConfigError("Zoho API token is not configured")
             return []
 
         base_params = dict(filter_dict or {})
@@ -168,20 +171,30 @@ class ZohoSync:
 
                 page += 1
 
+            elapsed = time.perf_counter() - start
+            self.metrics["tickets_fetched"] += len(tickets)
+            logger.info(f"Fetched {len(tickets)} ticket(s) from Zoho in {elapsed:.3f}s")
             return tickets
 
         except requests.RequestException as e:
             logger.error(f"Error fetching tickets from Zoho: {e}")
             return tickets
 
-    def get_ticket_by_crm_id(self, crm_id: str) -> Optional[Ticket]:
+    def get_ticket_by_crm_id(self, crm_id: str, raise_on_error: bool = False) -> Optional[Ticket]:
         """Fetch a single ticket by its Zoho CRM id and convert to Ticket.
 
-        This is a thin wrapper and will return None on errors.
+        By default (raise_on_error=False) this returns None on any failure,
+        preserving prior behavior. Pass raise_on_error=True to raise
+        ZohoConfigError (missing token) or ZohoAPIError (failed API call)
+        instead.
         """
+        fm = self.field_map
         if not self.token:
+            if raise_on_error:
+                raise ZohoConfigError("Zoho API token is not configured")
             return None
         url = f"{self.api_base}/crm/v2/Tickets/{crm_id}"
+        self.metrics["requests_made"] += 1
         try:
             resp = self._request_with_retry("GET", url, headers=self._headers(), timeout=10)
             resp.raise_for_status()
@@ -190,25 +203,42 @@ class ZohoSync:
                 return None
             # reuse logic from fetch_tickets - minimal mapping
             crm_id = str(item.get("id"))
-            subject = item.get("Subject") or "No subject"
-            desc = item.get("Description") or ""
-            customer = CustomerInfo(id=str(item.get("Contact_Name", {}).get("id") if isinstance(item.get("Contact_Name"), dict) else "unknown"),
-                                    name=item.get("Contact_Name", {}).get("name") if isinstance(item.get("Contact_Name"), dict) else item.get("Contact_Name"),
-                                    email=item.get("Email") or "")
+            subject = item.get(fm["subject"]) or "No subject"
+            desc = item.get(fm["description"]) or ""
+            contact_field = item.get(fm["contact_name"])
+            customer = CustomerInfo(
+                id=str(contact_field.get("id") if isinstance(contact_field, dict) else "unknown"),
+                name=contact_field.get("name") if isinstance(contact_field, dict) else contact_field,
+                email=item.get(fm["email"]) or ""
+            )
             ticket = Ticket(id=f"zoho-{crm_id}", subject=subject, description=desc, customer=customer, crm_ticket_id=crm_id, crm_system="zoho")
             return ticket
         except requests.RequestException as e:
+            self.metrics["requests_failed"] += 1
             logger.error(f"Error fetching Zoho ticket {crm_id}: {e}")
+            if raise_on_error:
+                status_code, body = self._error_details(e)
+                raise ZohoAPIError(
+                    f"Error fetching Zoho ticket {crm_id}: {e}", status_code=status_code, response_body=body
+                ) from e
             return None
 
-    def sync_ticket_to_zoho(self, ticket: Ticket) -> bool:
+    def sync_ticket_to_zoho(self, ticket: Ticket, raise_on_error: bool = False) -> bool:
         """Sync local ticket updates to Zoho.
 
         For Phase 2 we implement a minimal update of status and comments.
         Returns True on success.
+
+        By default (raise_on_error=False) this returns False on any failure,
+        preserving prior behavior. Pass raise_on_error=True to raise
+        ZohoConfigError (missing token/crm_ticket_id) or ZohoAPIError (failed
+        API call) instead.
         """
+        fm = self.field_map
         if not self.token or not ticket.crm_ticket_id:
             logger.warning("Cannot sync to Zoho: missing token or crm_ticket_id")
+            if raise_on_error:
+                raise ZohoConfigError("Cannot sync to Zoho: missing token or crm_ticket_id")
             return False
 
         url = f"{self.api_base}/crm/v2/Tickets/{ticket.crm_ticket_id}"
@@ -216,16 +246,23 @@ class ZohoSync:
             "data": [
                 {
                     # Map fields; Zoho field names may vary per setup
-                    "Status": ticket.status.value,
-                    "Description": ticket.description
+                    fm["status"]: ticket.status.value,
+                    fm["description"]: ticket.description
                 }
             ]
         }
+        self.metrics["requests_made"] += 1
         try:
             resp = self._request_with_retry("PUT", url, headers=self._headers(), json=payload, timeout=10)
             resp.raise_for_status()
             logger.info(f"Synced ticket {ticket.id} to Zoho (crm_id={ticket.crm_ticket_id})")
             return True
         except requests.RequestException as e:
+            self.metrics["requests_failed"] += 1
             logger.error(f"Failed to sync ticket to Zoho: {e}")
+            if raise_on_error:
+                status_code, body = self._error_details(e)
+                raise ZohoAPIError(
+                    f"Failed to sync ticket to Zoho: {e}", status_code=status_code, response_body=body
+                ) from e
             return False
