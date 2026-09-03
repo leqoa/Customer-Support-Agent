@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Local SQLite dev database (default DATABASE_URL target for backend/models/db/)
+*.db
+*.db-journal
