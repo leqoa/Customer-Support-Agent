@@ -5,6 +5,8 @@ This is intentionally a lightweight implementation with clear TODOs and
 places to harden authentication, paging, rate-limiting, and webhook handling.
 """
 import os
+import random
+import time
 import logging
 from typing import List, Dict, Any, Optional
 import requests
@@ -33,9 +35,19 @@ class ZohoSync:
     - Verify response schemas and map custom fields
     """
 
-    def __init__(self, api_base: str = ZOHO_API_BASE, token: Optional[str] = None):
+    def __init__(
+        self,
+        api_base: str = ZOHO_API_BASE,
+        token: Optional[str] = None,
+        max_retry_attempts: int = DEFAULT_MAX_RETRY_ATTEMPTS,
+        retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+        retry_jitter: float = DEFAULT_RETRY_JITTER,
+    ):
         self.api_base = api_base
         self.token = token or ZOHO_API_TOKEN
+        self.max_retry_attempts = max_retry_attempts
+        self.retry_base_delay = retry_base_delay
+        self.retry_jitter = retry_jitter
         if not self.token:
             logger.warning("Zoho API token is not configured. ZohoSync will not call external APIs.")
 
@@ -171,7 +183,7 @@ class ZohoSync:
             return None
         url = f"{self.api_base}/crm/v2/Tickets/{crm_id}"
         try:
-            resp = requests.get(url, headers=self._headers(), timeout=10)
+            resp = self._request_with_retry("GET", url, headers=self._headers(), timeout=10)
             resp.raise_for_status()
             item = resp.json().get("data", [None])[0]
             if not item:
@@ -210,7 +222,7 @@ class ZohoSync:
             ]
         }
         try:
-            resp = requests.put(url, headers=self._headers(), json=payload, timeout=10)
+            resp = self._request_with_retry("PUT", url, headers=self._headers(), json=payload, timeout=10)
             resp.raise_for_status()
             logger.info(f"Synced ticket {ticket.id} to Zoho (crm_id={ticket.crm_ticket_id})")
             return True
