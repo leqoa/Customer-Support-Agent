@@ -2,7 +2,31 @@
 
 Provides basic methods to fetch tickets from Zoho and sync updates back.
 This is intentionally a lightweight implementation with clear TODOs and
-places to harden authentication, paging, rate-limiting, and webhook handling.
+places to harden paging, rate-limiting, and webhook handling.
+
+Authentication
+---------------
+ZohoSync authenticates using Zoho's OAuth2 refresh-token flow. Required
+environment variables:
+
+- ``ZOHO_OAUTH_CLIENT_ID``      - OAuth2 client id from the Zoho API console
+- ``ZOHO_OAUTH_CLIENT_SECRET``  - OAuth2 client secret from the Zoho API console
+- ``ZOHO_REFRESH_TOKEN``        - Long-lived refresh token issued for the client
+
+Optional:
+
+- ``ZOHO_ACCOUNTS_BASE`` - Zoho accounts/token endpoint base URL, for
+  region-specific data centers (default: https://accounts.zoho.com; use
+  e.g. https://accounts.zoho.eu, https://accounts.zoho.in,
+  https://accounts.zoho.com.au as appropriate for your Zoho org's DC).
+
+Access tokens are fetched on demand and cached in memory until shortly
+before they expire, then transparently refreshed.
+
+Deprecated: a static ``ZOHO_API_TOKEN`` env var is still honored as a
+fallback when the OAuth2 env vars above are not set, for backward
+compatibility with older deployments. It is never refreshed and logs a
+deprecation warning; new deployments should use the OAuth2 flow instead.
 """
 import os
 import random
@@ -16,7 +40,15 @@ from backend.models.ticket import Ticket, CustomerInfo, TicketPriority, TicketSt
 logger = logging.getLogger(__name__)
 
 ZOHO_API_BASE = os.getenv("ZOHO_API_BASE", "https://www.zohoapis.com")
-ZOHO_API_TOKEN = os.getenv("ZOHO_API_TOKEN")  # Bearer token
+ZOHO_ACCOUNTS_BASE = os.getenv("ZOHO_ACCOUNTS_BASE", "https://accounts.zoho.com")
+ZOHO_OAUTH_CLIENT_ID = os.getenv("ZOHO_OAUTH_CLIENT_ID")
+ZOHO_OAUTH_CLIENT_SECRET = os.getenv("ZOHO_OAUTH_CLIENT_SECRET")
+ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
+ZOHO_API_TOKEN = os.getenv("ZOHO_API_TOKEN")  # Deprecated static bearer token
+
+
+class ZohoAuthError(Exception):
+    """Raised when a Zoho access token cannot be obtained or refreshed."""
 
 # Zoho CRM v2 allows a maximum of 200 records per page.
 ZOHO_MAX_PAGE_SIZE = 200
@@ -53,7 +85,8 @@ class ZohoSync:
             logger.warning("Zoho API token is not configured. ZohoSync will not call external APIs.")
 
     def _headers(self) -> Dict[str, str]:
-        return {"Authorization": f"Zoho-oauthtoken {self.token}", "Content-Type": "application/json"}
+        token = self._get_valid_token()
+        return {"Authorization": f"Zoho-oauthtoken {token}", "Content-Type": "application/json"}
 
     @staticmethod
     def _item_to_ticket(item: Dict[str, Any]) -> Ticket:
@@ -176,6 +209,9 @@ class ZohoSync:
             logger.info(f"Fetched {len(tickets)} ticket(s) from Zoho in {elapsed:.3f}s")
             return tickets
 
+        except ZohoAuthError as e:
+            logger.error(f"Zoho authentication error while fetching tickets: {e}")
+            return []
         except requests.RequestException as e:
             logger.error(f"Error fetching tickets from Zoho: {e}")
             return tickets
@@ -213,6 +249,9 @@ class ZohoSync:
             )
             ticket = Ticket(id=f"zoho-{crm_id}", subject=subject, description=desc, customer=customer, crm_ticket_id=crm_id, crm_system="zoho")
             return ticket
+        except ZohoAuthError as e:
+            logger.error(f"Zoho authentication error while fetching ticket {crm_id}: {e}")
+            return None
         except requests.RequestException as e:
             self.metrics["requests_failed"] += 1
             logger.error(f"Error fetching Zoho ticket {crm_id}: {e}")
@@ -257,6 +296,9 @@ class ZohoSync:
             resp.raise_for_status()
             logger.info(f"Synced ticket {ticket.id} to Zoho (crm_id={ticket.crm_ticket_id})")
             return True
+        except ZohoAuthError as e:
+            logger.error(f"Zoho authentication error while syncing ticket: {e}")
+            return False
         except requests.RequestException as e:
             self.metrics["requests_failed"] += 1
             logger.error(f"Failed to sync ticket to Zoho: {e}")
