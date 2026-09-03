@@ -17,14 +17,13 @@ logger = logging.getLogger(__name__)
 ZOHO_API_BASE = os.getenv("ZOHO_API_BASE", "https://www.zohoapis.com")
 ZOHO_API_TOKEN = os.getenv("ZOHO_API_TOKEN")  # Bearer token
 
-# Retry/backoff defaults for transient Zoho API failures (rate limits, 5xx,
-# connection hiccups). Kept as module-level constants so they're easy to
-# tune without hunting through the retry logic itself.
-DEFAULT_MAX_RETRY_ATTEMPTS = 4
-DEFAULT_RETRY_BASE_DELAY = 0.5  # seconds
-DEFAULT_RETRY_JITTER = 0.25  # seconds, max additional random delay
-RETRYABLE_STATUS_CODES = {429}
-RETRYABLE_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+# Zoho CRM v2 allows a maximum of 200 records per page.
+ZOHO_MAX_PAGE_SIZE = 200
+
+# Hard safety cap on the number of pages fetched in a single fetch_tickets()
+# call, so a pathological/misbehaving API response (e.g. more_records stuck
+# at true) can't cause an unbounded loop.
+MAX_PAGES = 50
 
 
 class ZohoSync:
@@ -32,7 +31,7 @@ class ZohoSync:
 
     NOTE: This is a Phase 2 scaffold. Real deployments should:
     - Use OAuth2 refresh tokens and automatic refresh
-    - Implement full paging, rate-limit backoff, and webhook listener
+    - Implement rate-limit backoff and webhook listener
     - Verify response schemas and map custom fields
     """
 
@@ -55,142 +54,125 @@ class ZohoSync:
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Zoho-oauthtoken {self.token}", "Content-Type": "application/json"}
 
-    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Perform an HTTP request with retry/backoff for transient failures.
+    @staticmethod
+    def _item_to_ticket(item: Dict[str, Any]) -> Ticket:
+        """Convert a single Zoho CRM record into an internal Ticket object.
 
-        Retries on HTTP 429, any 5xx status code, and connection/timeout
-        errors. Uses exponential backoff with jitter between attempts, and
-        honors a `Retry-After` header on 429 responses when present.
-
-        Raises the last encountered exception (requests.RequestException) or
-        returns the final (non-retryable, or exhausted) requests.Response.
+        Extracted from fetch_tickets() so the same defensive mapping logic
+        can be reused across paginated pages (and elsewhere) without
+        duplication.
         """
-        last_exception: Optional[Exception] = None
-        last_response: Optional[requests.Response] = None
+        # Defensive extraction
+        crm_id = str(item.get("id") or item.get("ticket_id") or "")
+        subject = item.get("Subject") or item.get("subject") or "No subject"
+        desc = item.get("Description") or item.get("description") or ""
+        contact_name = item.get("Contact_Name", {}).get("name") if isinstance(item.get("Contact_Name"), dict) else item.get("Contact_Name")
+        contact_id = (item.get("Contact_Name", {}).get("id") if isinstance(item.get("Contact_Name"), dict) else None)
 
-        for attempt in range(1, self.max_retry_attempts + 1):
-            try:
-                response = requests.request(method, url, **kwargs)
-            except RETRYABLE_EXCEPTIONS as exc:
-                last_exception = exc
-                if attempt >= self.max_retry_attempts:
-                    logger.error(
-                        f"Zoho request {method} {url} failed after {attempt} attempt(s): {exc}"
-                    )
-                    raise
-                delay = self._compute_backoff_delay(attempt)
-                logger.warning(
-                    f"Zoho request {method} {url} attempt {attempt}/{self.max_retry_attempts} "
-                    f"raised {exc!r}; retrying in {delay:.2f}s"
-                )
-                time.sleep(delay)
-                continue
+        customer = CustomerInfo(
+            id=str(contact_id or "unknown"),
+            name=contact_name or "Unknown",
+            email=item.get("Email") or "",
+            phone=item.get("Phone"),
+            account_id=item.get("Account_Name", {}).get("id") if isinstance(item.get("Account_Name"), dict) else None,
+            crm_link=item.get("ticket_url")
+        )
 
-            is_retryable_status = response.status_code == 429 or response.status_code >= 500
-            if not is_retryable_status:
-                return response
+        priority_raw = (item.get("Priority") or "Medium").lower()
+        priority = TicketPriority.MEDIUM
+        if "high" in priority_raw:
+            priority = TicketPriority.HIGH
+        if "critical" in priority_raw:
+            priority = TicketPriority.CRITICAL
+        if "low" in priority_raw:
+            priority = TicketPriority.LOW
 
-            last_response = response
-            if attempt >= self.max_retry_attempts:
-                logger.error(
-                    f"Zoho request {method} {url} failed after {attempt} attempt(s); "
-                    f"final status {response.status_code}"
-                )
-                return response
+        status_raw = (item.get("Status") or "new").lower().replace(" ", "_")
+        status = TicketStatus.NEW
+        for s in TicketStatus:
+            if s.value == status_raw:
+                status = s
 
-            delay = self._compute_backoff_delay(attempt)
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                if retry_after is not None:
-                    try:
-                        delay = float(retry_after)
-                    except ValueError:
-                        pass
+        return Ticket(
+            id=f"zoho-{crm_id}",
+            subject=subject,
+            description=desc,
+            customer=customer,
+            status=status,
+            priority=priority,
+            crm_ticket_id=crm_id,
+            crm_system="zoho",
+            crm_link=item.get("ticket_url")
+        )
 
-            logger.warning(
-                f"Zoho request {method} {url} attempt {attempt}/{self.max_retry_attempts} "
-                f"got status {response.status_code}; retrying in {delay:.2f}s"
-            )
-            time.sleep(delay)
-
-        # Should be unreachable, but keep a defensive fallback.
-        if last_exception is not None:
-            raise last_exception
-        return last_response
-
-    def _compute_backoff_delay(self, attempt: int) -> float:
-        """Exponential backoff with jitter for the given attempt number (1-indexed)."""
-        return self.retry_base_delay * (2 ** (attempt - 1)) + random.uniform(0, self.retry_jitter)
-
-    def fetch_tickets(self, filter_dict: Optional[Dict[str, Any]] = None) -> List[Ticket]:
+    def fetch_tickets(
+        self,
+        filter_dict: Optional[Dict[str, Any]] = None,
+        page_size: int = ZOHO_MAX_PAGE_SIZE,
+        max_records: Optional[int] = None,
+    ) -> List[Ticket]:
         """Fetch tickets from Zoho and convert into internal Ticket objects.
 
         filter_dict is mapped into query params for Zoho; this implementation keeps it simple.
+
+        Results are paginated automatically: pages are fetched using Zoho's
+        `page`/`per_page` query params until the response's
+        `info.more_records` is falsy, an optional `max_records` cap is
+        reached, or the internal MAX_PAGES safety limit is hit.
+
+        Args:
+            filter_dict: caller-supplied query params; pagination params are
+                layered on top and never override existing keys.
+            page_size: records requested per page (Zoho's max is 200).
+            max_records: optional cap on the total number of records
+                returned; None means unlimited (subject to MAX_PAGES).
         """
         if not self.token:
             logger.debug("Zoho token missing; returning empty ticket list (mock mode)")
             return []
 
-        params = filter_dict or {}
+        base_params = dict(filter_dict or {})
         url = f"{self.api_base}/crm/v2/Tickets"
+        tickets: List[Ticket] = []
+
+        page = 1
+        pages_fetched = 0
         try:
-            resp = self._request_with_retry("GET", url, headers=self._headers(), params=params, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            tickets = []
-            # Zoho CRM structure varies per org; this code assumes common fields
-            for item in data.get("data", []):
-                # Defensive extraction
-                crm_id = str(item.get("id") or item.get("ticket_id") or "")
-                subject = item.get("Subject") or item.get("subject") or "No subject"
-                desc = item.get("Description") or item.get("description") or ""
-                contact_name = item.get("Contact_Name", {}).get("name") if isinstance(item.get("Contact_Name"), dict) else item.get("Contact_Name")
-                contact_id = (item.get("Contact_Name", {}).get("id") if isinstance(item.get("Contact_Name"), dict) else None)
+            while True:
+                params = dict(base_params)
+                params["page"] = page
+                params["per_page"] = page_size
 
-                customer = CustomerInfo(
-                    id=str(contact_id or "unknown"),
-                    name=contact_name or "Unknown",
-                    email=item.get("Email") or "",
-                    phone=item.get("Phone"),
-                    account_id=item.get("Account_Name", {}).get("id") if isinstance(item.get("Account_Name"), dict) else None,
-                    crm_link=item.get("ticket_url")
-                )
+                resp = requests.get(url, headers=self._headers(), params=params, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                pages_fetched += 1
 
-                priority_raw = (item.get("Priority") or "Medium").lower()
-                priority = TicketPriority.MEDIUM
-                if "high" in priority_raw:
-                    priority = TicketPriority.HIGH
-                if "critical" in priority_raw:
-                    priority = TicketPriority.CRITICAL
-                if "low" in priority_raw:
-                    priority = TicketPriority.LOW
+                # Zoho CRM structure varies per org; this code assumes common fields
+                for item in data.get("data", []):
+                    tickets.append(self._item_to_ticket(item))
+                    if max_records is not None and len(tickets) >= max_records:
+                        return tickets[:max_records]
 
-                status_raw = (item.get("Status") or "new").lower().replace(" ", "_")
-                status = TicketStatus.NEW
-                for s in TicketStatus:
-                    if s.value == status_raw:
-                        status = s
+                info = data.get("info") or {}
+                more_records = bool(info.get("more_records"))
+                if not more_records:
+                    break
 
-                ticket = Ticket(
-                    id=f"zoho-{crm_id}",
-                    subject=subject,
-                    description=desc,
-                    customer=customer,
-                    status=status,
-                    priority=priority,
-                    crm_ticket_id=crm_id,
-                    crm_system="zoho",
-                    crm_link=item.get("ticket_url")
-                )
-                tickets.append(ticket)
+                if pages_fetched >= MAX_PAGES:
+                    logger.warning(
+                        f"Reached MAX_PAGES ({MAX_PAGES}) while fetching Zoho tickets; "
+                        "stopping pagination early. Remaining records were not fetched."
+                    )
+                    break
+
+                page += 1
 
             return tickets
 
         except requests.RequestException as e:
-            logger.error(
-                f"Error fetching tickets from Zoho after up to {self.max_retry_attempts} attempt(s): {e}"
-            )
-            return []
+            logger.error(f"Error fetching tickets from Zoho: {e}")
+            return tickets
 
     def get_ticket_by_crm_id(self, crm_id: str) -> Optional[Ticket]:
         """Fetch a single ticket by its Zoho CRM id and convert to Ticket.
