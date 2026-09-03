@@ -1,3 +1,8 @@
+# Runtime dependencies only. Dev/test/lint tooling lives in requirements-dev.txt.
+# NOTE: `logging` was previously (incorrectly) pinned here as `logging==0.5.1.2`.
+# `logging` is part of the Python standard library, not a PyPI package to install;
+# the PyPI package of that name is an unrelated, ancient artifact that fails to
+# build on modern Python. It has been removed.
 fastapi==0.104.0
 uvicorn==0.24.0
 pydantic==2.5.0
