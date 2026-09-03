@@ -1,0 +1,16 @@
+You are drafting a response to a customer support ticket.
+
+Ticket Subject: {subject}
+Ticket Description: {description}
+Classification: {classification}
+Relevant Knowledge (JSON): {knowledge}
+
+Write a helpful, empathetic, and professional draft response to the customer.
+Respond using EXACTLY this format (no extra commentary before or after it):
+
+SUMMARY: <one-sentence summary of the issue and the resolution approach>
+ACTIONS:
+- <suggested action 1>
+- <suggested action 2>
+RESPONSE:
+<the full draft response to send to the customer>
